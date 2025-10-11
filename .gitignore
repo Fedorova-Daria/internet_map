@@ -55,19 +55,19 @@ celerybeat.pid
 # -----------------------------
 # NODE.JS & REACT
 # -----------------------------
-# Зависимости
-/node_modules/
 
+# Зависимости
+frontend/node_modules/
+/build/
 # Логи
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# Собранный проект (продакшн-сборка)
-/build/
 
 # -----------------------------
 # БАЗЫ ДАННЫХ
 # -----------------------------
+
 # Дамп базы данных Redis
 dump.rdb
