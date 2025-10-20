@@ -15,7 +15,7 @@ class Domain(models.Model):
 class IPAddress(models.Model):
     address = models.GenericIPAddressField()
     subnet = models.ManyToManyField('Subnet', related_name='ips')
-    online = models.BooleanField()
+    online = models.BooleanField(default=False)
 
     def __str__(self):
         return self.address
