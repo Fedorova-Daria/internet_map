@@ -3,12 +3,13 @@
   "version": "0.1.0",
   "private": true,
   "dependencies": {
+    "@reactflow/core": "^11.10.0",
     "antd": "^5.10.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "@reactflow/core": "^11.10.0",
-    "reactflow": "^11.10.0",
+    "react-router-dom": "^7.9.4",
     "react-scripts": "5.0.1",
+    "reactflow": "^11.10.0",
     "zustand": "^4.4.0"
   },
   "devDependencies": {
