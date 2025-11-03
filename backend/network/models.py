@@ -1,5 +1,7 @@
 from django.db import models
 import ipaddress
+import uuid
+from scanner.models import ScanSession
 
 
 class Domain(models.Model):
@@ -43,4 +45,44 @@ class Subnet(models.Model):
             return ipaddress.ip_address(ip) in self.network_obj
         except ValueError:
             return False
+
+
+class SSLCertificate(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    scan_session = models.ForeignKey(
+        "ScanSession",
+        on_delete=models.CASCADE,
+        related_name="certificates"
+    )
+
+    domain = models.CharField(max_length=255, db_index=True)
+    fingerprint_sha256 = models.CharField(max_length=64, unique=True)
+    subject = models.JSONField(default=dict, blank=True)
+    issuer = models.JSONField(default=dict, blank=True)
+
+    not_before = models.DateTimeField()
+    not_after = models.DateTimeField()
+
+    san = models.JSONField(default=list, blank=True)  # Subject Alternative Names
+    raw_data = models.TextField(blank=True, null=True)  # PEM, если хочешь сохранить оригинал
+    is_expired = models.BooleanField(default=False)
+
+    first_seen = models.DateTimeField(auto_now_add=True)
+    last_seen = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "network_ssl_certificate"
+        ordering = ("-not_after",)
+        indexes = [
+            models.Index(fields=["fingerprint_sha256"]),
+            models.Index(fields=["domain"]),
+        ]
+
+    def __str__(self):
+        return f"{self.domain} ({self.fingerprint_sha256[:8]}...)"
+
+    def mark_expired(self):
+        """Отметить серт как истекший."""
+        self.is_expired = True
+        self.save(update_fields=["is_expired"])
 
