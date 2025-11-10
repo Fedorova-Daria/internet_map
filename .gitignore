@@ -38,7 +38,7 @@ env/
 __pycache__/
 *.py[cod]
 *$py.class
-
+cache
 # База данных SQLite (для локальной разработки, если используется)
 db.sqlite3
 

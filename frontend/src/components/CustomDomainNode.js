@@ -1,8 +1,8 @@
 import React from 'react';
 import { Handle, Position } from 'reactflow';
 
-function CustomIpNode({ data }) {
-  const label = data.label || 'Неизвестный IP';
+function CustomDomainNode({ data }) {
+  const label = data.label || 'Неизвестный домен';
 
   return (
     <div
@@ -10,17 +10,17 @@ function CustomIpNode({ data }) {
         background: '#fff',
         padding: '10px',
         borderRadius: '6px',
-        border: `2px solid #FF9900`,
+        border: `2px solid #38BDF8`,
         position: 'relative',
         boxShadow: '0 2px 10px rgba(0,0,0,0.1)',
-        maxWidth: '160px',
+        maxWidth: '180px',
       }}
     >
       <Handle
         type='target'
         position={Position.Top}
         style={{
-          background: '#FF9900',
+          background: '#38BDF8',
           width: '10px',
           height: '10px',
           borderRadius: '50%',
@@ -39,14 +39,14 @@ function CustomIpNode({ data }) {
         <span
           style={{
             display: 'inline-block',
-            background: '#FFF0E0',
-            color: '#FF9900',
+            background: '#E6E6E6',
+            color: '#666',
             padding: '2px 6px',
             borderRadius: '4px',
             fontSize: '10px',
           }}
         >
-          IP
+          Домен
         </span>
         <span style={{ fontWeight: 'bold', color: '#333' }}>{label}</span>
       </div>
@@ -69,7 +69,7 @@ function CustomIpNode({ data }) {
         type='source'
         position={Position.Bottom}
         style={{
-          background: '#FF9900',
+          background: '#38BDF8',
           width: '10px',
           height: '10px',
           borderRadius: '50%',
@@ -79,4 +79,4 @@ function CustomIpNode({ data }) {
   );
 }
 
-export default CustomIpNode;
+export default CustomDomainNode;

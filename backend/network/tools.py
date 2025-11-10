@@ -12,7 +12,7 @@ import ssl
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 import datetime
-
+import ipaddress 
 
 DEFAULT_CACHE_DIR = "cache/crtsh"
 DEFAULT_SLEEP = 1.0
@@ -171,39 +171,49 @@ def extract_common_names(crtsh_json):
     return sorted(names)
 
 
-def get_nameservers(domain: str):
-    w = whois.whois(domain)
-    result = []
-    for line in w.text.splitlines():
-        line = line.strip()
-        if line.lower().startswith("nserver:"):
-            # берём всё после 'nserver:'
-            result.append(line.split(":", 1)[1].strip())
-    return result
+def get_nameservers(domain: str) -> List[str]:
+    """Получить NS-серверы домена"""
+    try:
+        w = whois.whois(domain)
+        result = []
+        for line in w.text.splitlines():
+            line = line.strip()
+            if line.lower().startswith("nserver:"):
+                ns = line.split(":", 1)[1].strip()
+                if ns:
+                    result.append(ns)
+        return result
+    except Exception:
+        # Fallback: DNS запрос напрямую
+        try:
+            answers = dns.resolver.resolve(domain, 'NS')
+            return [r.to_text().rstrip('.') for r in answers]
+        except Exception:
+            return []
 
 
 def extract_base_domains(subdomains: List[str]) -> List[str]:
-    """
-    Из списка субдоменов возвращает уникальные базовые домены.
-    Например, ['mail.tyuiu.ru', 'www.tyuiu.ru'] -> ['tyuiu.ru']
-    """
+    """Возвращает уникальные базовые домены (правильно обрабатывает .co.uk, .com.br и т.д.)"""
     base_domains: Set[str] = set()
+    
     for sub in subdomains:
-        parts = sub.strip().split('.')
-        if len(parts) >= 2:
-            base_domains.add('.'.join(parts[-2:]))  # берём последние два элемента
+        sub = sub.strip().rstrip('.')
+        # Простой подход: берём последние 2-3 части
+        # Для точности нужна база данных публичных суффиксов (Public Suffix List)
+        # Но пока используем простую эвристику
+        parts = sub.split('.')
+        
+        if len(parts) >= 3:
+            # Проверяем, похоже ли на .co.uk или .com.br
+            if parts[-2] in ('co', 'com', 'net', 'org', 'gov'):
+                base_domains.add('.'.join(parts[-3:]))
+            else:
+                base_domains.add('.'.join(parts[-2:]))
+        elif len(parts) == 2:
+            base_domains.add(sub)
+    
     return list(base_domains)
 
-
-def get_ip_from_domain(domain: str):
-    """
-    Возвращает список IP для домена (A-записи)
-    """
-    try:
-        answers = dns.resolver.resolve(domain, 'A')
-        return [r.to_text() for r in answers]
-    except Exception:
-        return []
 
 
 def grab_tls_names(ip: str,
@@ -328,9 +338,10 @@ def grab_tls_names(ip: str,
 # -------------------------
 # Простое DNS resolve + CNAME follow
 # -------------------------
-def resolve_domain_a_aaaa(domain: str, follow_cname: bool = True, max_cname: int = 5, timeout: float = 3.0):
+def resolve_domain_ipv4(domain: str, follow_cname: bool = True, max_cname: int = 5, timeout: float = 3.0):
     """
-    Возвращает (set of ips, list of cname_chain)
+    Возвращает (set of IPv4 addresses, list of cname_chain).
+    Полностью игнорирует IPv6 (AAAA-записи).
     """
     domain = domain.strip().rstrip('.')
     ips = set()
@@ -342,40 +353,94 @@ def resolve_domain_a_aaaa(domain: str, follow_cname: bool = True, max_cname: int
 
         cur = domain
         for depth in range(max_cname):
-            # сначала A
+            # ✅ Запрашиваем только A-записи
             try:
                 ans = resolver.resolve(cur, 'A', raise_on_no_answer=False)
                 if ans:
                     for r in ans:
-                        ips.add(r.to_text())
-                # AAAA
-                ans6 = resolver.resolve(cur, 'AAAA', raise_on_no_answer=False)
-                if ans6:
-                    for r in ans6:
-                        ips.add(r.to_text())
+                        # Убедимся, что это валидный IPv4
+                        try:
+                            ip_addr = ipaddress.ip_address(r.to_text())
+                            if ip_addr.version == 4:
+                                ips.add(r.to_text())
+                        except ValueError:
+                            pass # Игнорируем невалидные адреса
             except dns.exception.DNSException:
                 pass
 
             if not follow_cname:
                 break
 
-            # check CNAME
+            # Проверяем CNAME, как и раньше
             try:
                 cname_ans = resolver.resolve(cur, 'CNAME', raise_on_no_answer=False)
                 if cname_ans:
-                    # берем первую цель
                     target = cname_ans[0].to_text().rstrip('.')
                     cname_chain.append((cur, target))
                     cur = target
                     continue
             except dns.exception.DNSException:
                 pass
-            break  # нет CNAME, выходим
+            break
     except Exception:
         pass
     return ips, cname_chain
 
+def get_domains_from_tls(ip: str, port: int = 443) -> List[str]:
+    """
+    Подключается к IP-адресу, извлекает SSL-сертификат и возвращает
+    список доменных имен (CN и SANs) из него.
+    """
+    try:
+        # grab_tls_names возвращает (set_of_names, meta_dict)
+        # Нам нужен только первый элемент - множество имен
+        names, meta = grab_tls_names(ip, port)
+        # Отфильтровываем wildcard-домены, так как они нам не нужны для сканирования
+        return sorted([name for name in names if '*' not in name])
+    except Exception:
+        return []
+    
+def scan_subnet_for_tls(cidr: str, port: int = 443, timeout: float = 0.5) -> list:
+    """
+    Быстро сканирует подсеть на наличие открытого порта 443 и, если порт открыт,
+    пытается извлечь доменные имена из SSL-сертификата.
 
+    :param cidr: Подсеть в формате CIDR, например, "192.168.1.0/24".
+    :param port: Порт для проверки (по умолчанию 443 для HTTPS).
+    :param timeout: Тайм-аут для проверки каждого хоста.
+    :return: Список кортежей [(ip, [domain1, domain2, ...]), ...]
+    """
+    found_hosts = []
+    try:
+        network = ipaddress.ip_network(cidr, strict=False)
+        print(f"[Subnet Scan] Сканируем {network.num_addresses} адресов в подсети {cidr}...")
+    except ValueError:
+        print(f"[Subnet Scan] Ошибка: некорректный CIDR {cidr}")
+        return []
+
+    for ip in network.hosts():
+        ip_str = str(ip)
+        sock = None
+        try:
+            # Используем неблокирующий connect_ex для быстрой проверки порта
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            # connect_ex возвращает 0, если порт открыт
+            if sock.connect_ex((ip_str, port)) == 0:
+                print(f"[Subnet Scan] Найден открытый порт {port} на {ip_str}. Проверяем SSL...")
+                # Только теперь, когда мы знаем, что хост жив, вызываем дорогую функцию
+                tls_domains = get_domains_from_tls(ip_str, port)
+                if tls_domains:
+                    print(f"[Subnet Scan] На {ip_str} найдены домены: {tls_domains}")
+                    found_hosts.append((ip_str, tls_domains))
+        except Exception as e:
+            # Игнорируем ошибки (например, "connection refused")
+            pass
+        finally:
+            if sock:
+                sock.close()
+                
+    return found_hosts
 # --------------------------
 # Примеры использования:
 # --------------------------
