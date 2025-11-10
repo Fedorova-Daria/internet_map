@@ -1,5 +1,6 @@
 # backend/network/scanner.py
 
+
 from collections import deque
 from .models import Domain, IPAddress, Link
 from .tools import (
@@ -8,9 +9,17 @@ from .tools import (
     fetch_crtsh_json,
     extract_common_names,
     grab_tls_names,
+    scan_subnet_for_tls,
     resolve_domain_a_aaaa,
 )
 import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s %(message)s',
+    datefmt='%H:%M:%S'
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -100,11 +109,21 @@ class InternetMapScanner:
         
         try:
             cidr, org = rdap_lookup(ip)
+            logger.info(f"RDAP для {ip}: {cidr} ({org})")
+
             ip_obj, _ = IPAddress.objects.get_or_create(address=ip)
             ip_obj.organization = org
             ip_obj.cidr = cidr
             ip_obj.save()
             logger.debug(f"RDAP для {ip}: org={org}, cidr={cidr}")
+
+            results = scan_subnet_for_tls(cidr, port=443, timeout=0.5)
+            for host_ip, tls_domains in results:
+                for d in tls_domains:
+                    # сохраняем связи домен <-> IP
+                    self._save_link(self.session, d, host_ip, method='tls-cert')
+                    domains.add(d)
+                    logger.info(f"Из TLS сертификата {host_ip}: {d}")
         except Exception as e:
             logger.warning(f"RDAP ошибка для {ip}: {e}")
         
