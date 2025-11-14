@@ -11,7 +11,7 @@ export const useStore = create((set, get) => ({
   fetchGraphData: async (domain) => {
     set({ loading: true, error: null });
     try {
-      const response = await axios.get(`/api/links/graph/?domain=${domain}`);
+      const response = await axios.get(`/api/links/graph/?domain=tyuiu.ru`);
       set({
         nodes: response.data.nodes || [],
         edges: response.data.edges || [],
@@ -24,14 +24,14 @@ export const useStore = create((set, get) => ({
   },
 
   // ✅ НОВАЯ ФУНКЦИЯ: для запуска сканирования
-  startScan: async (domain, depth = 3) => {
+  startScan: async (domain, depth = 2) => {
     set({ loading: true, error: null, nodes: [], edges: [] }); // Сбрасываем все перед новым сканированием
     try {
       // Шаг 1: Отправляем запрос на сканирование
-      await axios.post('/api/domains/scan/', {
-        domain: domain,
-        depth: depth,
-      });
+      //await axios.post('/api/domains/scan/', {
+      //  domain: domain,
+      //  depth: depth,
+      //});
 
       // Шаг 2: После успешного сканирования, вызываем загрузку данных графа
       // Используем get() для доступа к другим экшенам стора

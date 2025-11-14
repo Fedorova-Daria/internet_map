@@ -1,32 +1,29 @@
-# backend/tasks.py
+# backend/network/tasks.py
 
 from celery import shared_task
 from .scanner import InternetMapScanner
+from .models import ScanSession
 import logging
 
 logger = logging.getLogger(__name__)
 
 @shared_task
-def scan_domain_task(root_domain: str, max_depth: int = 3):
-    """
-    Асинхронная задача сканирования домена.
-    Выполняется в фоне через Celery.
-    """
-    logger.info(f"Запущена задача сканирования: {root_domain}")
-    
+def run_scanner_task(session_id):
     try:
-        scanner = InternetMapScanner(max_depth=max_depth)
-        domains_found, ips_found = scanner.scan(root_domain)
-        
-        logger.info(f"Сканирование завершено: {domains_found} доменов, {ips_found} IP")
-        return {
-            'status': 'success',
-            'domains_found': domains_found,
-            'ips_found': ips_found
-        }
+        session = ScanSession.objects.get(id=session_id)
+        session.status = 'running'
+        session.save()
+        logger.info(f"Запуск сканирования для сессии {session_id}, домен: {session.root_domain}")
+
+        scanner = InternetMapScanner(session=session, max_depth=session.depth)
+        scanner.scan(session.root_domain)
+
+        # Обновляем статус при завершении
+        session.status = 'completed'
+        session.save()
+        logger.info(f"Сканирование для сессии {session_id} завершено.")
     except Exception as e:
-        logger.error(f"Ошибка при сканировании: {e}")
-        return {
-            'status': 'error',
-            'error': str(e)
-        }
+        logger.error(f"Ошибка сканирования сессии {session_id}: {e}")
+        if session:
+            session.status = 'failed'
+            session.save()

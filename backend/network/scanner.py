@@ -8,9 +8,9 @@ from .tools import (
     rdap_lookup,
     fetch_crtsh_json,
     extract_common_names,
-    grab_tls_names,
+    get_domains_from_tls, 
     scan_subnet_for_tls,
-    resolve_domain_a_aaaa,
+    resolve_domain_ipv4, 
 )
 import logging
 
@@ -23,111 +23,114 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+
 class InternetMapScanner:
-    # ✅ Принимаем экземпляр сессии сканирования
     def __init__(self, session, max_depth=3, max_rate_limit=1.0):
-        self.session = session # Сохраняем сессию
+        self.session = session
         self.max_depth = max_depth
         self.max_rate_limit = max_rate_limit
         self.visited_domains = set()
         self.visited_ips = set()
-    
+        # ✅ Заводим "память" для просканированных подсетей
+        self.scanned_subnets = set()
+        self.queue = deque()
+
     def scan(self, root_domain: str):
-        """Основной BFS алгоритм сканирования."""
         logger.info(f"Начинаем сканирование: {root_domain}")
-        
-        queue = deque([(root_domain, 0)])
-        
-        while queue:
-            domain, depth = queue.popleft()
-            
-            logger.info(f"[Уровень {depth}] Сканируем: {domain}")
+        self.queue.clear()
+        self.queue.append((root_domain, 0))
+
+        while self.queue:
+            domain, depth = self.queue.popleft()
             
             if domain in self.visited_domains:
-                logger.debug(f"Домен {domain} уже обработан, пропускаем")
                 continue
             
+            logger.info(f"[Глубина {depth}] Сканируем: {domain}")
             self.visited_domains.add(domain)
-            
-            if depth > self.max_depth:
-                logger.info(f"Достигнут лимит глубины {self.max_depth}")
-                break
-            
-            # ШАГ 1: DNS запрос
+
+            if depth >= self.max_depth:
+                logger.info(f"Достигнут лимит глубины {self.max_depth} для ветки {domain}")
+                continue
+
+            # ШАГ 1: DNS запрос (только IPv4)
             ips = self._get_ips_for_domain(domain)
             logger.info(f"Найдено {len(ips)} IP адресов для {domain}: {ips}")
-            
+
             for ip in ips:
-                if ip not in self.visited_ips:
-                    self.visited_ips.add(ip)
-                    self._save_link(self.session, domain, ip, method='dns')
-                    
-                    # ШАГ 2: Reverse DNS
-                    reverse_domains = self._get_reverse_domains(ip)
-                    logger.info(f"Найдено {len(reverse_domains)} обратных доменов для IP {ip}")
-                    
-                    for rev_domain in reverse_domains:
-                        if rev_domain not in self.visited_domains and depth + 1 <= self.max_depth:
-                            queue.append((rev_domain, depth + 1))
-                            logger.info(f"Добавлен в очередь (reverse): {rev_domain}")
-            
-            # ШАГ 3: crt.sh поддомены (ТОЛЬКО ПРЯМЫЕ!)
+                if ip in self.visited_ips:
+                    continue
+                
+                self.visited_ips.add(ip)
+                self._save_link(self.session, domain, ip, method='dns')
+
+                # ШАГ 2: Reverse DNS
+                reverse_domains = get_domains_from_ip_reverse_dns(ip)
+                logger.info(f"Найдено {len(reverse_domains)} обратных доменов для IP {ip}")
+                for rev_domain in reverse_domains:
+                    if rev_domain not in self.visited_domains:
+                        queue.append((rev_domain, depth + 1))
+                        logger.info(f"Добавлен в очередь (Reverse DNS): {rev_domain}")
+
+                # ШАГ 2.5: SSL-сертификат на самом IP
+                tls_domains = get_domains_from_tls(ip)
+                logger.info(f"Найдено {len(tls_domains)} доменов из SSL для IP {ip}")
+                for tls_domain in tls_domains:
+                    if tls_domain not in self.visited_domains:
+                        self._save_link(self.session, tls_domain, ip, method='tls-cert')
+                        queue.append((tls_domain, depth + 1))
+                        logger.info(f"Добавлен в очередь (SSL): {tls_domain}")
+                
+                # ✅ ШАГ 2.6: Сканирование подсети (перенесено сюда и улучшено)
+                self._scan_ip_subnet(ip, depth)
+
+            # ШАГ 3: crt.sh поддомены
             subdomains = self._get_subdomains_from_crtsh(domain)
             logger.info(f"Найдено {len(subdomains)} прямых поддоменов из crt.sh для {domain}")
-            
             for subdomain in subdomains:
-                if subdomain not in self.visited_domains and depth + 1 <= self.max_depth:
-                    queue.append((subdomain, depth + 1))
+                if subdomain not in self.visited_domains:
+                    self.queue.append((subdomain, depth + 1))
+                    self._save_link(self.session, root_domain, subdomain, method='crtsh')  # Прямая связь по домену
                     logger.info(f"Добавлен в очередь (crt.sh): {subdomain}")
-        
+
         logger.info(f"Сканирование завершено. Найдено доменов: {len(self.visited_domains)}, IP: {len(self.visited_ips)}")
         return len(self.visited_domains), len(self.visited_ips)
-    
+
+    # ✅ Метод для DNS-запроса теперь использует правильную функцию
     def _get_ips_for_domain(self, domain: str) -> list:
-        """Получить IP адреса для домена через DNS."""
-        ips = set()
-        
-        try:
-            dns_ips, _ = resolve_domain_a_aaaa(domain, follow_cname=True)
-            ips.update(dns_ips)
-            logger.debug(f"DNS запрос для {domain}: {dns_ips}")
-        except Exception as e:
-            logger.warning(f"DNS ошибка для {domain}: {e}")
-        
+        """Получить IP адреса для домена через DNS (только IPv4)."""
+        ips, _ = resolve_domain_ipv4(domain, follow_cname=True)
         return list(ips)
-    
-    def _get_reverse_domains(self, ip: str) -> set:
-        """Найти домены на этом IP."""
-        domains = set()
-        
-        try:
-            reverse_domains = get_domains_from_ip_reverse_dns(ip)
-            domains.update(reverse_domains)
-            logger.debug(f"Reverse DNS для {ip}: {reverse_domains}")
-        except Exception as e:
-            logger.warning(f"Reverse DNS ошибка для {ip}: {e}")
-        
+
+    # ✅ Создаем отдельный, чистый метод для сканирования подсети
+    def _scan_ip_subnet(self, ip: str, current_depth: int):
+        """Определяет подсеть для IP и запускает ее 'умное' сканирование."""
         try:
             cidr, org = rdap_lookup(ip)
-            logger.info(f"RDAP для {ip}: {cidr} ({org})")
 
+            # Обновляем информацию об IP в БД
             ip_obj, _ = IPAddress.objects.get_or_create(address=ip)
             ip_obj.organization = org
             ip_obj.cidr = cidr
             ip_obj.save()
-            logger.debug(f"RDAP для {ip}: org={org}, cidr={cidr}")
 
-            results = scan_subnet_for_tls(cidr, port=443, timeout=0.5)
-            for host_ip, tls_domains in results:
-                for d in tls_domains:
-                    # сохраняем связи домен <-> IP
-                    self._save_link(self.session, d, host_ip, method='tls-cert')
-                    domains.add(d)
-                    logger.info(f"Из TLS сертификата {host_ip}: {d}")
+            # ✅ Проверяем, сканировали ли мы эту подсеть ранее
+            if cidr and cidr not in self.scanned_subnets:
+                logger.info(f"Начинаем сканирование новой подсети: {cidr}")
+                self.scanned_subnets.add(cidr)
+                
+                subnet_results = scan_subnet_for_tls(cidr)
+                for found_ip, found_domains in subnet_results:
+                    # Добавляем все найденные домены в очередь
+                    for found_domain in found_domains:
+                        if found_domain not in self.visited_domains:
+                            self._save_link(self.session, found_domain, found_ip, method='tls-subnet')
+                            self.queue.append((found_domain, current_depth))
+                            logger.info(f"Добавлен в очередь (Subnet Scan): {found_domain}")
+            else:
+                logger.debug(f"Подсеть {cidr} уже сканировалась, пропускаем.")
         except Exception as e:
-            logger.warning(f"RDAP ошибка для {ip}: {e}")
-        
-        return domains
+            logger.warning(f"Не удалось обработать подсеть для IP {ip}: {e}")
     
     def _get_subdomains_from_crtsh(self, domain: str) -> set:
         """

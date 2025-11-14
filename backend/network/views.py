@@ -6,74 +6,170 @@ from rest_framework.response import Response
 from .models import Domain, IPAddress, Link, ScanSession
 from .serializers import DomainSerializer, IPAddressSerializer, LinkSerializer
 from .scanner import InternetMapScanner
-from .tasks import scan_domain_task
+from .tasks import run_scanner_task
 import logging
 from django.utils import timezone
 from datetime import timedelta
-
+from drf_yasg.utils import swagger_auto_schema
+from drf_yasg import openapi
+from .serializers import IPAddressSerializer, DomainSerializer, LinkSerializer
 logger = logging.getLogger(__name__)
 
-class DomainViewSet(viewsets.ModelViewSet):
-    """API для управления доменами"""
-    queryset = Domain.objects.all()
-    serializer_class = DomainSerializer
-    
+class DomainViewSet(viewsets.ViewSet):
+    @swagger_auto_schema(
+        request_body=openapi.Schema(
+            type=openapi.TYPE_OBJECT,
+            required=['domain'],
+            properties={
+                'domain': openapi.Schema(type=openapi.TYPE_STRING, description='Имя домена для сканирования', example='tyuiu.ru'),
+                'depth': openapi.Schema(type=openapi.TYPE_INTEGER, description='Глубина поиска поддоменов', example=2, default=2),
+            }
+        ),
+        responses={
+            202: openapi.Response(
+                description='Сканирование запущено',
+                examples={
+                    'application/json': {
+                        'status': 'Scan session created and scheduled',
+                        'session_id': 123,
+                        'domain': 'tyuiu.ru'
+                    }
+                }
+            ),
+            400: openapi.Response(description='Ошибка: отсутствует домен'),
+            500: openapi.Response(description='Внутренняя ошибка сервера')
+        },
+        operation_description="""Запускает асинхронное сканирование домена (например, tyuiu.ru) до указанной глубины. Передайте имя домена и глубину — получите ID сессии для последующего запроса."""
+    )
     @action(detail=False, methods=['post'])
     def scan(self, request):
-        domain = request.data.get('domain')
-        depth = int(request.data.get('depth', 3))
-        
-        if not domain:
-            return Response({'error': 'domain is required'}, status=status.HTTP_400_BAD_REQUEST)
+        domain_name = request.data.get('domain')
+        if not domain_name:
+            return Response({'error': 'Domain name is required'}, status=status.HTTP_400_BAD_REQUEST)
 
-        cache_ttl = timedelta(days=1)
-        # Теперь этот запрос будет работать, так как поля существуют
-        recent_session = ScanSession.objects.filter(
-            root_domain=domain,
-            depth=depth,
-            status='completed',
-            completed_at__gte=timezone.now() - cache_ttl
-        ).order_by('-completed_at').first()
+        depth = int(request.data.get('depth', 2))
 
-        if recent_session:
-            logger.info(f"Найдена сессия для {domain}. Возвращаем из кэша.")
-            return Response({'status': 'completed_from_cache', 'domain': domain}, status=status.HTTP_200_OK)
-        
-        session = ScanSession.objects.create(root_domain=domain, depth=depth, status='running')
-        
+        # Создаем объект сессии сканирования в базе данных
+        # Статус 'pending' (ожидание) означает, что задача создана, но еще не взята в работу
         try:
-            scanner = InternetMapScanner(session=session, max_depth=depth)
-            domains_found, ips_found = scanner.scan(domain)
-            
-            session.status = 'completed'
-            session.completed_at = timezone.now()
-            session.save()
-            
+            session = ScanSession.objects.create(
+                root_domain=domain_name,
+                depth=depth,
+                status='pending'
+            )
+            logger.info(f"Создана новая сессия сканирования ID: {session.id} для домена {domain_name}")
+
+            # ✅ ЗАПУСКАЕМ АСИНХРОННУЮ ЗАДАЧУ
+            # Мы передаем только ID сессии. Задача сама извлечет из нее все нужные данные.
+            run_scanner_task.delay(session.id)
+
+            # Мгновенно возвращаем ответ пользователю
             return Response({
-                'status': 'completed',
-                'domain': domain,
-                'domains_found': domains_found,
-                'ips_found': ips_found
-            }, status=status.HTTP_200_OK)
-            
+                'status': 'Scan session created and scheduled',
+                'session_id': session.id,
+                'domain': domain_name,
+            }, status=status.HTTP_202_ACCEPTED)
+
         except Exception as e:
-            session.status = 'failed'
-            session.completed_at = timezone.now()
-            session.save()
-            logger.error(f"Ошибка сканирования {domain}: {e}", exc_info=True)
-            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            logger.error(f"Не удалось создать сессию сканирования: {e}")
+            return Response({'error': 'Failed to create scan session'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    # ... ваш метод graph и другие методы остаются без изменений ...
+    # Убедитесь, что метод graph все еще здесь
+    @action(detail=False, methods=['get'])
+    def graph(self, request):
+        domain_name = request.query_params.get('domain')
+        if not domain_name:
+            return Response({'error': 'Domain parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
 
+        # Ищем последнюю ЗАВЕРШЕННУЮ сессию
+        latest_session = ScanSession.objects.filter(
+            root_domain=domain_name,
+            status='completed'
+        ).order_by('-created_at').first()
+
+        if not latest_session:
+            return Response({'nodes': [], 'edges': []}, status=status.HTTP_200_OK)
+
+        links = Link.objects.filter(scan_session=latest_session).select_related('domain', 'ip')
+        
+        nodes = {}
+        edges = []
+
+        for link in links:
+            # Добавляем узел домена
+            if link.domain.id not in nodes:
+                nodes[link.domain.id] = {
+                    'id': f'd-{link.domain.id}',
+                    'label': link.domain.name,
+                    'type': 'domain',
+                }
+            # Добавляем узел IP
+            if link.ip.id not in nodes:
+                nodes[link.ip.id] = {
+                    'id': f'ip-{link.ip.id}',
+                    'label': link.ip.address,
+                    'type': 'ip',
+                    'organization': link.ip.organization,
+                }
+            
+            # Добавляем ребро
+            edges.append({
+                'id': f'e-{link.id}',
+                'source': f'd-{link.domain.id}',
+                'target': f'ip-{link.ip.id}',
+                'type': 'direct' if link.method in ['dns', 'reverse_dns'] else 'via_ip',
+                'label': link.method,
+            })
+            
+        # Преобразуем словарь узлов в список
+        node_list = list(nodes.values())
+
+        return Response({'nodes': node_list, 'edges': edges})
+    
 class IPAddressViewSet(viewsets.ModelViewSet):
-    """API для управления IP адресами"""
+    """
+    API для получения, создания, обновления и удаления IP-адресов.
+    Возвращает базовую информацию: адрес, организацию, CIDR (подсеть).
+    """
     queryset = IPAddress.objects.all()
     serializer_class = IPAddressSerializer
 
 class LinkViewSet(viewsets.ModelViewSet):
-    """API для управления связями между доменами и IP"""
+    """
+    API для получения, создания, обновления и удаления связей между доменами и IP-адресами.
+    Каждая связь содержит тип (dns, tls, reverse_dns), дату, домен и IP.
+    """
     queryset = Link.objects.all()
     serializer_class = LinkSerializer
-    
+    @swagger_auto_schema(
+        manual_parameters=[
+            openapi.Parameter('domain', openapi.IN_QUERY, description="Имя домена для получения графа", type=openapi.TYPE_STRING, required=True)
+        ],
+        responses={
+            200: openapi.Response(
+                description='Граф связей для выбранного домена',
+                examples={
+                    'application/json': {
+                        'domain': 'tyuiu.ru',
+                        'nodes': [],
+                        'edges': [],
+                        'summary': {
+                            'total_nodes': 12,
+                            'total_edges': 17,
+                            'domains': 7,
+                            'ips': 5
+                        }
+                    }
+                }
+            ),
+            404: openapi.Response(description='Нет данных сканирования для указанного домена')
+        },
+        operation_description="""
+        Возвращает полный граф связей по домену (все уникальные домены/IP и все связи с типами и методами).
+        Используйте параметр domain для фильтрации (например, ?domain=tyuiu.ru).
+        """
+    )
     @action(detail=False, methods=['get'])
     def graph(self, request):
         domain_name = request.query_params.get('domain')
@@ -82,9 +178,8 @@ class LinkViewSet(viewsets.ModelViewSet):
 
         # ✅ Находим последнюю УСПЕШНУЮ сессию для этого домена
         latest_session = ScanSession.objects.filter(
-            root_domain=domain_name,
-            status='completed'
-        ).order_by('-created_at').first()
+        root_domain=domain_name
+        ).latest('created_at')
 
         if not latest_session:
             return Response({'error': f'Нет данных сканирования для домена {domain_name}'}, status=404)

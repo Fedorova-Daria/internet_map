@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useCallback, useRef } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useLocation } from 'react-router-dom';
 import ReactFlow, {
   Background,
   Controls,
@@ -15,11 +15,20 @@ import 'reactflow/dist/style.css';
 import * as d3 from 'd3-force';
 import { Button } from 'antd';
 
-const createForceLayout = (nodes, edges, { width, height }) => {
+const createForceLayout = (nodes, edges, { width, height, rootDomainName }) => {
+  // Находим корневой узел, чтобы зафиксировать его
+  const rootNode = nodes.find((n) => n.data.label === rootDomainName);
+
+  if (rootNode) {
+    // Фиксируем корневой узел в центре
+    rootNode.fx = width / 2;
+    rootNode.fy = height / 2;
+  }
+
   const graphData = {
     nodes: nodes.map((node) => ({
       ...node,
-      radius: Math.max(node.style.width, node.style.minHeight) / 2,
+      radius: node.type === 'customIpNode' ? 40 : 60, // Уменьшим радиус для IP
     })),
     links: edges.map((edge) => ({
       source: edge.source,
@@ -34,25 +43,37 @@ const createForceLayout = (nodes, edges, { width, height }) => {
       d3
         .forceLink(graphData.links)
         .id((d) => d.id)
-        .distance(250)
+        .distance(150)
+        .strength(0.5)
+    )
+    // ✅ Заменяем центрирование на РАДИАЛЬНОЕ расположение
+    .force(
+      'r',
+      d3
+        .forceRadial(
+          (d) => {
+            // Узлы, напрямую связанные с корнем, будут ближе
+            const isDirectLink = graphData.links.some(
+              (l) =>
+                (l.source.id === rootNode?.id && l.target.id === d.id) ||
+                (l.target.id === rootNode?.id && l.source.id === d.id)
+            );
+            return isDirectLink ? 200 : 500;
+          },
+          width / 2,
+          height / 2
+        )
         .strength(0.8)
     )
-    .force('charge', d3.forceManyBody().strength(-400))
-    .force('center', d3.forceCenter(width / 2, height / 2))
+    .force('charge', d3.forceManyBody().strength(-200)) // Уменьшаем отталкивание, т.к. радиальная сила уже расставляет узлы
     .force(
       'collision',
-      d3.forceCollide().radius((d) => d.radius + 30)
-    )
+      d3.forceCollide().radius((d) => d.radius + 15)
+    ) // Уменьшаем радиус столкновения
     .stop();
 
-  for (
-    let i = 0,
-      n = Math.ceil(
-        Math.log(simulation.alphaMin()) / Math.log(1 - simulation.alphaDecay())
-      );
-    i < n;
-    ++i
-  ) {
+  // Запускаем достаточное количество итераций для стабилизации
+  for (let i = 0, n = 300; i < n; ++i) {
     simulation.tick();
   }
 
@@ -69,11 +90,17 @@ const createForceLayout = (nodes, edges, { width, height }) => {
 
 function GraphPage() {
   const { nodes: rawNodes, edges: rawEdges, loading, error } = useStore();
-
   const [layoutedNodes, setLayoutedNodes, onNodesChange] = useNodesState([]);
   const [layoutedEdges, setLayoutedEdges, onEdgesChange] = useEdgesState([]);
   const containerRef = useRef(null);
   const navigate = useNavigate();
+  const location = useLocation(); // ✅ Получаем доступ к URL
+
+  // ✅ Извлекаем домен из URL, чтобы знать, какой узел корневой
+  const rootDomainName = useMemo(() => {
+    const searchParams = new URLSearchParams(location.search);
+    return searchParams.get('domain');
+  }, [location.search]);
 
   const nodeTypes = useMemo(
     () => ({
@@ -105,53 +132,50 @@ function GraphPage() {
       },
       position: { x: 0, y: 0 },
       style: {
-        width: node.type === 'ip' ? 120 : 180,
-        minHeight: node.type === 'ip' ? 60 : 80,
+        // Уменьшаем размеры узлов, чтобы они не были громоздкими
+        width: node.type === 'ip' ? 100 : 150,
+        minHeight: 40,
       },
     }));
 
-    const flowEdges = rawEdges.map((edge) => {
-      let edgeColor = '#ccc';
-      let edgeWidth = 2;
-
-      if (edge.type === 'direct') {
-        edgeColor = '#ff4d4f';
-        edgeWidth = 2.5;
-      } else if (edge.type === 'via_ip') {
-        edgeColor = '#1890ff';
-        edgeWidth = 2;
-      }
-
-      return {
-        id: edge.id.toString(),
-        source: edge.source.toString(),
-        target: edge.target.toString(),
-        animated: true,
-        style: { stroke: edgeColor, strokeWidth: edgeWidth },
-        label: edge.label || '',
-        data: { type: edge.type, ip: edge.ip },
-        markerEnd: {
-          type: MarkerType.ArrowClosed,
-          color: edgeColor,
-          width: 20,
-          height: 20,
-        },
-      };
-    });
+    const flowEdges = rawEdges.map((edge) => ({
+      id: edge.id.toString(),
+      source: edge.source.toString(),
+      target: edge.target.toString(),
+      animated: false,
+      style: {
+        stroke: edge.type === 'direct' ? '#ff4d4f' : '#1890ff',
+        strokeWidth: edge.type === 'direct' ? 1.5 : 1, // Делаем линии тоньше
+      },
+      label: '', // Убираем метки с ребер, чтобы не загромождать
+      markerEnd: {
+        type: MarkerType.ArrowClosed,
+        color: edge.type === 'direct' ? '#ff4d4f' : '#1890ff',
+        width: 15,
+        height: 15,
+      },
+    }));
 
     const layoutResult = createForceLayout(flowNodes, flowEdges, {
       width,
       height,
+      rootDomainName, // ✅ Передаем имя корневого домена
     });
 
-    // ✅ ИСПРАВЛЕНИЕ: Используем layoutResult.nodes напрямую
     setLayoutedNodes(layoutResult.nodes);
-    setLayoutedEdges(flowEdges);
-  }, [loading, rawNodes, rawEdges, setLayoutedNodes, setLayoutedEdges]);
+    setLayoutedEdges(layoutResult.edges);
+  }, [
+    loading,
+    rawNodes,
+    rawEdges,
+    setLayoutedNodes,
+    setLayoutedEdges,
+    rootDomainName,
+  ]);
 
   const onInit = useCallback((reactFlowInstance) => {
     setTimeout(() => {
-      reactFlowInstance.fitView({ padding: 0.2, duration: 800 });
+      reactFlowInstance.fitView({ padding: 0.1, duration: 800 });
     }, 100);
   }, []);
 
