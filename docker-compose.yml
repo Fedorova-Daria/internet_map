@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  # Сервис 1: Твой сайт (Django)
+  web:
+    build: ./backend # Путь к папке с Dockerfile
+    container_name: internet_map_backend
+    command: python manage.py runserver 0.0.0.0:8000
+    volumes:
+      - ./backend:/app # "Магия": связываем папку на твоем компе с папкой внутри
+    ports:
+      - '8000:8000' # Пробрасываем порт наружу
+    depends_on:
+      - db # Ждем, пока запустится база
+    environment:
+      - DB_HOST=db
+      - DB_NAME=internet_map_db
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+
+  # Сервис 2: База данных (PostgreSQL)
+  db:
+    image: postgres:15
+    container_name: internet_map_db
+    environment:
+      POSTGRES_DB: internet_map_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data # Чтобы данные не исчезли при перезапуске
+
+volumes:
+  postgres_data:

@@ -8,6 +8,7 @@ from .serializers import DomainSerializer, IPAddressSerializer, LinkSerializer
 from .scanner import InternetMapScanner
 from .tasks import run_scanner_task
 import logging
+from itertools import combinations
 from django.utils import timezone
 from datetime import timedelta
 from drf_yasg.utils import swagger_auto_schema
@@ -47,25 +48,56 @@ class DomainViewSet(viewsets.ViewSet):
         if not domain_name:
             return Response({'error': 'Domain name is required'}, status=status.HTTP_400_BAD_REQUEST)
 
-        depth = int(request.data.get('depth', 2))
+        # Получаем запрошенную глубину из POST-запроса.
+        requested_depth = int(request.data.get('depth', 2))
 
-        # Создаем объект сессии сканирования в базе данных
-        # Статус 'pending' (ожидание) означает, что задача создана, но еще не взята в работу
+        # --- НАЧАЛО НОВОЙ "УМНОЙ" ЛОГИКИ ---
+
+        # 1. Ищем самый глубокий из УЖЕ ЗАВЕРШЕННЫХ сканов для этого домена.
+        latest_completed_scan = ScanSession.objects.filter(
+            root_domain=domain_name,
+            status='completed'
+        ).order_by('-depth', '-created_at').first()
+
+        # 2. Проверяем, подходит ли он нам.
+        if latest_completed_scan and latest_completed_scan.depth >= requested_depth:
+            logger.info(f"Найден подходящий завершенный скан (ID: {latest_completed_scan.id}) с глубиной {latest_completed_scan.depth}. Новый скан не запускаем.")
+            # Сразу возвращаем ID этого скана, чтобы фронтенд мог запросить граф.
+            return Response({
+                'status': 'A suitable completed scan already exists.',
+                'session_id': latest_completed_scan.id, # <-- Отдаем ID готового скана
+                'domain': domain_name,
+            }, status=status.HTTP_200_OK) # <-- Обрати внимание, статус 200 OK, а не 202
+
+        # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
+
+        # Если мы дошли сюда, значит, подходящего скана нет. Запускаем новый.
         try:
+            # Добавим проверку, чтобы не создавать дублирующиеся задачи
+            existing_pending_scan = ScanSession.objects.filter(
+                root_domain=domain_name,
+                depth=requested_depth,
+                status__in=['pending', 'running']
+            ).first()
+
+            if existing_pending_scan:
+                logger.info(f"Скан с глубиной {requested_depth} уже в очереди (ID: {existing_pending_scan.id}).")
+                return Response({
+                    'status': 'Scan session is already pending or running.',
+                    'session_id': existing_pending_scan.id,
+                    'domain': domain_name,
+                }, status=status.HTTP_202_ACCEPTED)
+
+            logger.info(f"Запускаем новый скан для {domain_name} с глубиной {requested_depth}.")
             session = ScanSession.objects.create(
                 root_domain=domain_name,
-                depth=depth,
+                depth=requested_depth,
                 status='pending'
             )
-            logger.info(f"Создана новая сессия сканирования ID: {session.id} для домена {domain_name}")
-
-            # ✅ ЗАПУСКАЕМ АСИНХРОННУЮ ЗАДАЧУ
-            # Мы передаем только ID сессии. Задача сама извлечет из нее все нужные данные.
             run_scanner_task.delay(session.id)
-
-            # Мгновенно возвращаем ответ пользователю
+            
             return Response({
-                'status': 'Scan session created and scheduled',
+                'status': 'New scan session created and scheduled.',
                 'session_id': session.id,
                 'domain': domain_name,
             }, status=status.HTTP_202_ACCEPTED)
@@ -73,6 +105,7 @@ class DomainViewSet(viewsets.ViewSet):
         except Exception as e:
             logger.error(f"Не удалось создать сессию сканирования: {e}")
             return Response({'error': 'Failed to create scan session'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 
     # ... ваш метод graph и другие методы остаются без изменений ...
     # Убедитесь, что метод graph все еще здесь
@@ -88,8 +121,24 @@ class DomainViewSet(viewsets.ViewSet):
             status='completed'
         ).order_by('-created_at').first()
 
+        # Если сессия не найдена, запускаем новую асинхронную задачу
         if not latest_session:
-            return Response({'nodes': [], 'edges': []}, status=status.HTTP_200_OK)
+            try:
+                session = ScanSession.objects.create(
+                    root_domain=domain_name,
+                    depth=2,  # или возьми из параметров
+                    status='pending'
+                )
+                run_scanner_task.delay(session.id)
+                return Response({
+                    'status': 'Scan started, please check back later',
+                    'session_id': session.id,
+                    'nodes': [],
+                    'edges': []
+                }, status=status.HTTP_202_ACCEPTED)
+            except Exception as e:
+                logger.error(f"Failed to create scan session: {e}")
+                return Response({'error': 'Failed to start scan'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         links = Link.objects.filter(scan_session=latest_session).select_related('domain', 'ip')
         
@@ -173,107 +222,112 @@ class LinkViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'])
     def graph(self, request):
         domain_name = request.query_params.get('domain')
+        session_id = request.query_params.get('session_id')
+        
         if not domain_name:
-            return Response(...)
-
-        # ✅ Находим последнюю УСПЕШНУЮ сессию для этого домена
-        latest_session = ScanSession.objects.filter(
-        root_domain=domain_name
-        ).latest('created_at')
+            return Response({'error': 'Domain parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # ... (код поиска сессии остается без изменений) ...
+        latest_session = None
+        if session_id:
+            try:
+                latest_session = ScanSession.objects.get(id=session_id)
+            except ScanSession.DoesNotExist:
+                return Response({'error': f'Сессия с ID {session_id} не найдена'}, status=404)
+        else:
+            latest_session = ScanSession.objects.filter(root_domain=domain_name, status='completed').order_by('-created_at').first()
 
         if not latest_session:
-            return Response({'error': f'Нет данных сканирования для домена {domain_name}'}, status=404)
+            return Response({'nodes': [], 'edges': [], 'message': 'No completed scan found for this domain.'}, status=status.HTTP_200_OK)
 
-        # ✅ Получаем связи ТОЛЬКО для этой сессии
-        links = Link.objects.filter(scan_session=latest_session).select_related('domain', 'ip')
-        
-        # Собираем уникальные домены и IP из этих связей
-        domain_ids = links.values_list('domain_id', flat=True)
-        ip_ids = links.values_list('ip_id', flat=True)
-        
-        domains = Domain.objects.filter(id__in=set(domain_ids))
-        ips = IPAddress.objects.filter(id__in=set(ip_ids))
-        
-        
-        nodes = []
+        links_data = Link.objects.filter(scan_session=latest_session).values(
+            'id', 'domain__id', 'domain__name', 'ip__id', 'ip__address', 
+            'ip__organization', 'ip__cidr', 'method'
+        )[:500]
+
+        if not links_data:
+            return Response({'nodes': [], 'edges': [], 'message': 'No links found for this session.'}, status=200)
+
+        nodes = {}
         edges = []
-        visited_nodes = set()
-        
-        # Добавить все IP как узлы (синие блоки)
-        for ip in ips:
-            nodes.append({
-                'id': f'ip_{ip.address}',
-                'label': ip.address,
-                'type': 'ip',
-                'organization': ip.organization or 'Unknown',
-                'data': ip.address
-            })
-            visited_nodes.add(f'ip_{ip.address}')
-        
-        # Добавить все домены как узлы (зелёные блоки)
-        for domain in domains:
-            nodes.append({
-                'id': f'domain_{domain.name}',
-                'label': domain.name,
-                'type': 'domain',
-                'data': domain.name
-            })
-            visited_nodes.add(f'domain_{domain.name}')
-        
-        # Добавить рёбра с типами связей
-        # Домен → IP (красная линия - прямая связь)
-        domain_ip_pairs = set()
-        for link in links:
-            source = f'domain_{link.domain.name}'
-            target = f'ip_{link.ip.address}'
-            key = (source, target)
+        # Этот словарь теперь хранит связи через ЛЮБОЙ узел-посредник
+        connector_to_domains = {} 
+
+        for link in links_data:
+            domain_id_str = f'd-{link["domain__id"]}'
+            # ID посредника (может быть как IP, так и доменом)
+            connector_id_str = f'ip-{link["ip__id"]}' 
             
-            if key not in domain_ip_pairs:
-                edges.append({
-                    'id': f'edge_{source}_{target}',
-                    'source': source,
-                    'target': target,
-                    'type': 'direct',  # красная линия
-                    'method': link.method,
-                    'label': link.method
-                })
-                domain_ip_pairs.add(key)
-        
-        # IP → Домены (синяя линия - через IP)
-        # Каждый IP группирует несколько доменов
-        for ip in ips:
-            domains_on_ip = set()
-            for link in links:
-                if link.ip == ip:
-                    domains_on_ip.add(link.domain)
+            domain_label = link['domain__name']
+            connector_label = link['ip__address']
+
+            # Создаем узел для домена
+            if domain_id_str not in nodes:
+                node_type = 'domain' if any(char.isalpha() for char in domain_label) else 'ip'
+                nodes[domain_id_str] = {'id': domain_id_str, 'label': domain_label, 'type': node_type, 'data': domain_label}
+                if node_type == 'ip': nodes[domain_id_str]['organization'] = 'Unknown'
+
+            # Создаем узел для "посредника"
+            if connector_id_str not in nodes:
+                node_type = 'domain' if any(char.isalpha() for char in connector_label) else 'ip'
+                nodes[connector_id_str] = {'id': connector_id_str, 'label': connector_label, 'type': node_type, 'data': connector_label}
+                if node_type == 'ip': nodes[connector_id_str]['organization'] = link['ip__organization'] or 'Unknown'
+
+            # Добавляем прямую связь (зеленую)
+            edges.append({'id': f'e-{link["id"]}', 'source': domain_id_str, 'target': connector_id_str, 'type': 'direct', 'label': link['method']})
             
-            # Связать домены через IP (создай "косвенные" рёбра)
-            for domain1 in domains_on_ip:
-                for domain2 in domains_on_ip:
-                    if domain1.name != domain2.name:
-                        source = f'domain_{domain1.name}'
-                        target = f'domain_{domain2.name}'
-                        edge_id = f'edge_{min(source, target)}_{max(source, target)}'
-                        
-                        # Проверь, нет ли уже такого ребра
-                        if not any(e['id'] == edge_id for e in edges):
-                            edges.append({
-                                'id': edge_id,
-                                'source': source,
-                                'target': target,
-                                'type': 'via_ip',  # синяя линия
-                                'label': f'via {ip.address}',
-                                'ip': ip.address
-                            })
+            # Готовим данные для создания косвенных связей
+            if connector_id_str not in connector_to_domains: connector_to_domains[connector_id_str] = set()
+            connector_to_domains[connector_id_str].add(domain_id_str)
+            
+            # ... (код для подсетей не меняется) ...
+            subnet_cidr = link['ip__cidr']
+            if subnet_cidr:
+                subnet_id_str = f'sub-{subnet_cidr}'
+                if subnet_id_str not in nodes: nodes[subnet_id_str] = {'id': subnet_id_str, 'label': subnet_cidr, 'type': 'subnet', 'data': subnet_cidr}
+                edges.append({'id': f'member_{connector_id_str}_{subnet_id_str}', 'source': connector_id_str, 'target': subnet_id_str, 'type': 'member_of', 'label': 'belongs to'})
+
+        # --- СОЗДАНИЕ КОСВЕННЫХ СВЯЗЕЙ ---
+        
+        # 1. Связи через посредников (КРАСНЫЕ или СИНИЕ)
+        for connector_id, domain_set in connector_to_domains.items():
+            if len(domain_set) > 1 and connector_id in nodes:
+                connector_node = nodes[connector_id]
+                for domain1_id, domain2_id in combinations(domain_set, 2):
+                    # Если посредник - IP, линия КРАСНАЯ
+                    if connector_node['type'] == 'ip':
+                        edges.append({
+                            'id': f'via_{connector_id}_{domain1_id}_{domain2_id}',
+                            'source': domain1_id, 'target': domain2_id,
+                            'type': 'via_ip', # <-- RED
+                            'label': f'via {connector_node["label"]}'
+                        })
+                    # Если посредник - Домен, линия СИНЯЯ
+                    elif connector_node['type'] == 'domain':
+                        edges.append({
+                            'id': f'via_{connector_id}_{domain1_id}_{domain2_id}',
+                            'source': domain1_id, 'target': domain2_id,
+                            'type': 'subdomain', # <-- BLUE
+                            'label': f'alias via {connector_node["label"]}'
+                        })
+
+        # 2. Прямые связи поддоменов (тоже СИНИЕ)
+        domain_nodes = {node['label']: node['id'] for node in nodes.values() if node['type'] == 'domain'}
+        for name, domain_id in domain_nodes.items():
+            parts = name.split('.')
+            if len(parts) > 2:
+                parent_name = '.'.join(parts[1:])
+                if parent_name in domain_nodes:
+                    parent_id = domain_nodes[parent_name]
+                    edges.append({'id': f'sub_{parent_id}_{domain_id}', 'source': parent_id, 'target': domain_id, 'type': 'subdomain', 'label': 'subdomain of'})
+
+        node_list = list(nodes.values())
         
         return Response({
-            'domain': domain_name,
-            'nodes': nodes,
-            'edges': edges,
+            'domain': domain_name, 'nodes': node_list, 'edges': edges,
             'summary': {
-                'total_nodes': len(nodes),
-                'total_edges': len(edges),
-                'domains': len([n for n in nodes if n['type'] == 'domain']),
-                'ips': len([n for n in nodes if n['type'] == 'ip'])
+                'message': 'Showing a partial graph limited to 500 links.', 'total_nodes': len(node_list), 'total_edges': len(edges),
+                'domains': len([n for n in node_list if n['type'] == 'domain']), 'ips': len([n for n in node_list if n['type'] == 'ip']),
+                'subnets': len([n for n in node_list if n['type'] == 'subnet'])
             }
         })

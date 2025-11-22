@@ -3,17 +3,18 @@ import { Handle, Position } from 'reactflow';
 
 function CustomDomainNode({ data }) {
   const label = data.label || 'Неизвестный домен';
-
+  const isLongLabel = label.length > 28;
   return (
     <div
       style={{
         background: '#fff',
-        padding: '10px',
+        padding: '10px 12px',
         borderRadius: '6px',
         border: `2px solid #38BDF8`,
         position: 'relative',
         boxShadow: '0 2px 10px rgba(0,0,0,0.1)',
-        maxWidth: '180px',
+        minWidth: '150px',
+        maxWidth: '300px',
       }}
     >
       <Handle
@@ -33,7 +34,7 @@ function CustomDomainNode({ data }) {
           marginBottom: '5px',
           display: 'flex',
           alignItems: 'center',
-          gap: '5px',
+          gap: '8px',
         }}
       >
         <span
@@ -44,11 +45,23 @@ function CustomDomainNode({ data }) {
             padding: '2px 6px',
             borderRadius: '4px',
             fontSize: '10px',
+            flexShrink: 0,
           }}
         >
           Домен
         </span>
-        <span style={{ fontWeight: 'bold', color: '#333' }}>{label}</span>
+        <span
+          style={{
+            fontWeight: 'bold',
+            color: '#333',
+            fontSize: isLongLabel ? '11px' : '12px', // Уменьшаем шрифт для очень длинных доменов
+
+            wordBreak: 'break-all', // Позволяет разрывать длинные слова (важно для доменов без дефисов)
+            whiteSpace: 'pre-wrap', // Уважаем пробелы и переносим текст
+          }}
+        >
+          {label}
+        </span>
       </div>
 
       {data.organization && (
@@ -59,6 +72,7 @@ function CustomDomainNode({ data }) {
             marginTop: '5px',
             paddingTop: '5px',
             borderTop: '1px solid #E6E6E6',
+            wordBreak: 'break-word',
           }}
         >
           {data.organization}

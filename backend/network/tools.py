@@ -4,7 +4,10 @@ import json
 import os
 import hashlib
 import whois
+import subprocess
+import logging
 from ipwhois import IPWhois
+import xml.etree.ElementTree as ET
 import dns.resolver, dns.reversename
 from typing import List, Set, Tuple, Dict, Optional
 import socket
@@ -16,7 +19,7 @@ import ipaddress
 
 DEFAULT_CACHE_DIR = "cache/crtsh"
 DEFAULT_SLEEP = 1.0
-
+logger = logging.getLogger(__name__)
 
 def get_domains_from_ip_reverse_dns(ip: str) -> List[str]:
     """
@@ -276,9 +279,7 @@ def grab_tls_names(ip: str,
     try:
         sock = socket.create_connection((ip, port), timeout=timeout)
         sock.settimeout(timeout)
-        # Wrap socket with TLS; SNI set by server_hostname parameter
         ssock = ctx.wrap_socket(sock, server_hostname=sni_name)
-        # If handshake succeeded, get peer cert in DER form
         der = ssock.getpeercert(binary_form=True)
         meta['connected'] = True
 
@@ -295,7 +296,7 @@ def grab_tls_names(ip: str,
         except Exception:
             pass
 
-        # Subject CN (may be absent or deprecated)
+        # Subject CN 
         try:
             cn_attributes = cert.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)
             if cn_attributes:
@@ -335,9 +336,6 @@ def grab_tls_names(ip: str,
     return names, meta
 
 
-# -------------------------
-# Простое DNS resolve + CNAME follow
-# -------------------------
 def resolve_domain_ipv4(domain: str, follow_cname: bool = True, max_cname: int = 5, timeout: float = 3.0):
     """
     Возвращает (set of IPv4 addresses, list of cname_chain).
@@ -353,7 +351,7 @@ def resolve_domain_ipv4(domain: str, follow_cname: bool = True, max_cname: int =
 
         cur = domain
         for depth in range(max_cname):
-            # ✅ Запрашиваем только A-записи
+            # Запрашиваем только A-записи
             try:
                 ans = resolver.resolve(cur, 'A', raise_on_no_answer=False)
                 if ans:
@@ -390,14 +388,36 @@ def get_domains_from_tls(ip: str, port: int = 443) -> List[str]:
     """
     Подключается к IP-адресу, извлекает SSL-сертификат и возвращает
     список доменных имен (CN и SANs) из него.
+    
+    ВАЖНО: Фильтрует wildcard-домены и домены, которые на самом деле
+    являются IP-адресами (особенно приватными).
     """
     try:
-        # grab_tls_names возвращает (set_of_names, meta_dict)
-        # Нам нужен только первый элемент - множество имен
         names, meta = grab_tls_names(ip, port)
-        # Отфильтровываем wildcard-домены, так как они нам не нужны для сканирования
-        return sorted([name for name in names if '*' not in name])
-    except Exception:
+        
+        valid_domains = []
+        for name in names:
+            if '*' in name: # Игнорируем wildcard
+                continue
+
+            # Проверяем, не является ли "домен" IP-адресом
+            is_ip = False
+            try:
+                ip_obj = ipaddress.ip_address(name)
+                # Если это IP, проверяем, не приватный ли он
+                if ip_obj.is_private:
+                    logger.warning(f"Найден приватный IP ('{name}') в сертификате на {ip}. Игнорируем.")
+                    is_ip = True
+            except ValueError:
+                pass 
+
+            if not is_ip:
+                valid_domains.append(name)
+        
+        return sorted(valid_domains)
+        
+    except Exception as e:
+        logger.error(f"Ошибка при получении TLS доменов для {ip}: {e}")
         return []
     
 def scan_subnet_for_tls(cidr: str, port: int = 443, timeout: float = 0.5) -> list:
@@ -425,22 +445,156 @@ def scan_subnet_for_tls(cidr: str, port: int = 443, timeout: float = 0.5) -> lis
             # Используем неблокирующий connect_ex для быстрой проверки порта
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(timeout)
-            # connect_ex возвращает 0, если порт открыт
+            
             if sock.connect_ex((ip_str, port)) == 0:
                 print(f"[Subnet Scan] Найден открытый порт {port} на {ip_str}. Проверяем SSL...")
-                # Только теперь, когда мы знаем, что хост жив, вызываем дорогую функцию
                 tls_domains = get_domains_from_tls(ip_str, port)
                 if tls_domains:
                     print(f"[Subnet Scan] На {ip_str} найдены домены: {tls_domains}")
                     found_hosts.append((ip_str, tls_domains))
         except Exception as e:
-            # Игнорируем ошибки (например, "connection refused")
             pass
         finally:
             if sock:
                 sock.close()
                 
     return found_hosts
+
+def scan_subnet_with_nmap(cidr: str) -> list[tuple[str, list[str]]]:
+    """
+    Использует Nmap для сканирования подсети и извлекает домены из SSL-сертификатов.
+    Возвращает список кортежей (ip, [домен1, домен2, ...]).
+    Фильтрует невалидные домены и IP-адреса, найденные в полях для доменов.
+    """
+    logger = logging.getLogger(__name__)
+    results = []
+    try:
+        output_file = f"/tmp/{cidr.replace('/', '_')}_nmap.xml"
+        
+        command = [
+            "nmap", "-p", "443", "--open", "--script", "ssl-cert",
+            "-oX", output_file, cidr
+        ]
+        
+        logger.info(f"Nmap: запускаем сканирование подсети {cidr}...")
+        subprocess.run(command, check=True, timeout=900)
+
+        tree = ET.parse(output_file)
+        root = tree.getroot()
+
+        for host in root.findall('host'):
+            ip_address = host.find('address').get('addr')
+            raw_domains = []
+            
+            script_elem = host.find(".//script[@id='ssl-cert']")
+            if script_elem is not None:
+
+                for elem in script_elem.findall(".//elem[@key='subject']//elem[@key='commonName']"):
+                    if elem.text: raw_domains.append(elem.text)
+                for elem in script_elem.findall(".//elem[@key='alternativeNames']//elem"):
+                    if elem.text: raw_domains.append(elem.text)
+            
+            if not raw_domains:
+                continue
+
+            clean_domains = set()
+            for name in raw_domains:
+                name = name.strip()
+                if not name or '*' in name:
+                    continue
+
+                is_ip = False
+                try:
+                    ip_obj = ipaddress.ip_address(name)
+                    logger.warning(f"Nmap нашел IP-адрес ('{name}') в сертификате на {ip_address}. Игнорируем.")
+                    is_ip = True
+                except ValueError:
+                    pass 
+
+                if not is_ip:
+                    clean_domains.add(name)
+
+
+            if clean_domains:
+                logger.info(f"[Subnet Scan] На {ip_address} найдены валидные домены: {list(clean_domains)}")
+                results.append((ip_address, list(clean_domains)))
+
+    except (subprocess.CalledProcessError, ET.ParseError, Exception) as e:
+        logger.error(f"Ошибка при работе Nmap для подсети {cidr}: {e}")
+    
+    try:
+        if os.path.exists(output_file):
+            os.remove(output_file)
+    except OSError as e:
+        logger.warning(f"Не удалось удалить временный файл nmap {output_file}: {e}")
+        
+    return results
+
+def get_subdomains_with_theharvester(domain_name: str) -> set:
+    """
+    Использует theHarvester для поиска поддоменов и их IP-адресов.
+    Возвращает множество кортежей (поддомен, ip).
+    """
+    subdomains_with_ips = set()
+    
+    try:
+        output_file = f"/tmp/{domain_name.replace('/', '_')}_harvester.json"
+        command = ["theHarvester", "-d", domain_name, "-b", "all", "-f", output_file]
+        
+        logger.info(f"Запуск theHarvester для {domain_name}...")
+        subprocess.run(command, check=True, timeout=300, capture_output=True, text=True)
+
+        with open(output_file, 'r') as f:
+            report = json.load(f)
+
+        all_hosts = report.get("hosts", [])
+        logger.info(f"theHarvester вернул {len(all_hosts)} записей для {domain_name}.")
+
+        for entry in all_hosts:
+            host = None
+            ips = []
+
+            if ':' in entry:
+                parts = entry.split(':', 1)
+                host = parts[0].strip()
+                if parts[1]:
+                    ips = [ip.strip() for ip in parts[1].split(',') if ip.strip()]
+            else:
+                host = entry.strip()
+
+            if not host:
+                continue
+            
+            if host.startswith('*.'):
+                continue
+
+            is_ip_address = False
+            try:
+                ipaddress.ip_address(host)
+                is_ip_address = True
+            except ValueError:
+                pass
+
+            if is_ip_address:
+                logger.warning(f"theHarvester вернул IP ('{host}') как хост. Игнорируем.")
+                continue
+
+            # Если все проверки пройдены, добавляем в результат
+            if ips:
+                for ip in ips:
+                    try: # Проверяем валидность каждого IP
+                        ipaddress.ip_address(ip)
+                        subdomains_with_ips.add((host, ip))
+                    except ValueError:
+                        pass
+            else:
+                subdomains_with_ips.add((host, None)) # Добавляем домен без IP
+
+    except Exception as e:
+        logger.error(f"Критическая ошибка в theHarvester для {domain_name}: {e}")
+    
+    logger.info(f"Обработано и добавлено {len(subdomains_with_ips)} уникальных хостов.")
+    return subdomains_with_ips
 # --------------------------
 # Примеры использования:
 # --------------------------

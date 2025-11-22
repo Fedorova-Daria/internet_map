@@ -190,8 +190,8 @@ function GraphPage() {
   if (error || (!loading && rawNodes.length === 0)) {
     return (
       <div style={{ padding: '20px', textAlign: 'center', marginTop: '150px' }}>
-        <h2>{error || 'Нет данных для отображения.'}</h2>
-        <p>Попробуйте запустить сканирование снова.</p>
+        <h2>{error || 'Нет данных для отображения графа.'}</h2>
+        <p>Возможно, сканирование еще не завершено или произошла ошибка.</p>
         <Button type='primary' onClick={() => navigate('/')}>
           Вернуться на главную
         </Button>
@@ -217,7 +217,7 @@ function GraphPage() {
         attributionPosition='top-left'
       >
         <Background gap={16} size={1} color='#E6E6E6' />
-        <Controls />
+        {/* <Controls /> */}
       </ReactFlow>
       {/* Легенда */}
       <div
@@ -225,46 +225,123 @@ function GraphPage() {
           position: 'absolute',
           bottom: 20,
           left: 20,
-          background: 'white',
+          // Используем RGBA для полупрозрачного темного фона
+          background: 'rgba(40, 40, 40, 0.85)',
+          // Добавляем эффект размытия фона для "матового стекла"
+          backdropFilter: 'blur(10px)',
+          WebkitBackdropFilter: 'blur(10px)', // Для поддержки Safari
           padding: '15px',
-          borderRadius: '8px',
-          boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
+          borderRadius: '12px', // Сделаем скругление чуть больше
+          boxShadow: '0 4px 12px rgba(0,0,0,0.3)', // Тень посильнее для контраста
           zIndex: 10,
-          fontSize: '12px',
+          fontSize: '14px', // Чуть увеличим шрифт для читаемости
+          color: '#E0E0E0', // Светло-серый цвет текста по умолчанию
+          border: '1px solid rgba(255, 255, 255, 0.1)', // Тонкая светлая рамка
+          width: '220px', // Зададим фиксированную ширину
         }}
       >
-        <div style={{ marginBottom: '10px', fontWeight: 'bold' }}>Легенда:</div>
-        <div style={{ display: 'flex', gap: '15px', marginBottom: '10px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+        <div
+          style={{
+            marginBottom: '12px',
+            fontWeight: 'bold',
+            fontSize: '16px', // Увеличим заголовок
+            color: '#FFFFFF', // Белый цвет для заголовка
+            textAlign: 'center',
+            borderBottom: '1px solid rgba(255, 255, 255, 0.1)', // Разделитель
+            paddingBottom: '10px',
+          }}
+        >
+          Легенда
+        </div>
+
+        {/* Типы узлов */}
+        <div
+          style={{
+            marginBottom: '15px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '10px',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
             <div
               style={{
                 width: '20px',
                 height: '20px',
                 background: '#38BDF8',
                 borderRadius: '4px',
+                border: '1px solid #7DD3FC',
               }}
             />
             <span>Домен</span>
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
             <div
               style={{
                 width: '20px',
                 height: '20px',
                 background: '#FF9900',
                 borderRadius: '4px',
+                border: '1px solid #FFC966',
               }}
             />
-            <span>IP адрес</span>
+            <span>IP-адрес</span>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <div
+              style={{
+                width: '20px',
+                height: '20px',
+                background: '#4B5563',
+                borderRadius: '4px',
+                border: '1px solid #9CA3AF',
+              }}
+            />
+            <span>Подсеть</span>
           </div>
         </div>
-        <div style={{ marginBottom: '5px' }}>
-          <span style={{ color: '#ff4d4f', fontWeight: 'bold' }}>───</span>
-          <span> Прямая связь</span>
-        </div>
-        <div>
-          <span style={{ color: '#1890ff', fontWeight: 'bold' }}>───</span>
-          <span> Связь через IP</span>
+
+        {/* Типы связей */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span
+              style={{
+                color: '#34D399',
+                fontWeight: 'bold',
+                fontSize: '20px',
+                lineHeight: '1',
+              }}
+            >
+              -
+            </span>
+            <span>Прямая связь (DNS)</span>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span
+              style={{
+                color: '#F87171',
+                fontWeight: 'bold',
+                fontSize: '20px',
+                lineHeight: '1',
+              }}
+            >
+              -
+            </span>
+            <span>Связь через IP</span>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span
+              style={{
+                color: '#60A5FA',
+                fontWeight: 'bold',
+                fontSize: '20px',
+                lineHeight: '1',
+              }}
+            >
+              -
+            </span>
+            <span>Связь поддоменов</span>
+          </div>
         </div>
       </div>
     </div>
